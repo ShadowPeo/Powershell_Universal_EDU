@@ -1,0 +1,5 @@
+#Ignore Testing files
+**/Testing
+
+#Ignore all Mac system files
+**/.DS_Store
