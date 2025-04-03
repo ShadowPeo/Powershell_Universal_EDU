@@ -25,15 +25,20 @@
 # - Check to see if user accounts have expired and if so disable them
 # ==============================================================================================
 
-#Validate and Set the Staff OU
-$staffOU = if ($activeDirectoryStaffDN -notlike "$activeDirectoryBaseDN%") {
-    "$activeDirectoryStaffDN,$activeDirectoryBaseDN"
-} else {
-    $activeDirectoryStaffDN
-}
+#===========================
+#       FUNCTIONS
+#===========================
 
-function Send-emailNotification($emailTo, $emailFrom, $SMTPServer, $disabledUsers)
+function Send-emailNotification
 {
+    param
+    (
+        [Parameter(Mandatory=$true)][array]$emailTo, ##CONVERT TO ARRAY TYPE
+        [Parameter(Mandatory=$true)][string]$emailFrom,
+        [Parameter(Mandatory=$true)][string]$SMTPServer,
+        [Parameter(Mandatory=$true)][array]$disabledUsers  ##CONVERT TO ARRAY TYPE
+    )
+
     $disabledUsers=($disabledUsers -join "<br>")
     $emailBody = @"
 <!DOCTYPE html>
@@ -137,6 +142,49 @@ font-size: 20px;
     }
  }
 
+#Disable Staff Member
+function Disable-staffMember
+{
+    param
+    (
+        [Parameter(Mandatory=$true)][PSCustomObject]$userIdentity,
+        [Parameter(Mandatory=$true)][string]$userDescription
+    )
+
+    #Get new password to reset randomly
+    $retrievedPassword = $null
+    try
+    {
+      $retrievedPassword = (Invoke-WebRequest -UseBasicParsing "http://www.dinopass.com/password/strong").content
+    }
+    catch
+    {
+      $retrievedPassword = "krQVz6ov296pVhisbYED5ebbHwF1q3eo"
+    }
+
+    #Excludes CRT Accounts from being moved or having the password reset
+    if ($userIdentity.samAccountName -notmatch "CRT\d{2}")
+    {
+        Move-ADObject -Identity $userIdentity.distinguishedName -TargetPath "OU=Inactive,$staffOU" -ErrorAction SilentlyContinue -Credential $Secret:activeDirectoryStaffUserAccess
+        Set-ADAccountPassword -Identity $userIdentity.samAccountName -Reset -NewPassword (ConvertTo-SecureString -AsPlainText $retrievedPassword -Force) -Credential $Secret:activeDirectoryStaffUserAccess
+    }
+
+    Set-ADUser -Identity $userIdentity.samAccountName -Enabled $false -Credential $Secret:activeDirectoryStaffUserAccess
+    Set-ADUser -Identity $userIdentity.samAccountName -Description $userDescription -Credential $Secret:activeDirectoryStaffUserAccess
+
+}
+
+#===========================
+#       MAIN CODE
+#===========================
+
+
+#Validate and Set the Staff OU
+$staffOU = if ($activeDirectoryStaffDN -notlike "$activeDirectoryBaseDN%") {
+    "$activeDirectoryStaffDN,$activeDirectoryBaseDN"
+} else {
+    $activeDirectoryStaffDN
+}
 
 $adServers = (Get-ADDomaincontroller -Filter *)
 $userStatus = @()
@@ -144,7 +192,7 @@ $disabledUsers=@()
 
 foreach ($domainController in $adServers)
 {
-    $adUsers = Get-ADuser -filter * -properties employeeID,employeeNumber,lastLogon,whenCreated,enabled -Server $domainController.hostname -SearchBase $staffOU | Select-Object samAccountName,DistinguishedName,employeeID,employeeNumber,lastLogon,whenCreated,enabled
+    $adUsers = Get-ADuser -filter * -properties employeeID,employeeNumber,lastLogon,whenCreated,enabled -Server $domainController.hostname -SearchBase $staffOU -Credential $Secret:activeDirectoryStaffUserAccess | Select-Object samAccountName,DistinguishedName,employeeID,employeeNumber,lastLogon,whenCreated,enabled
     foreach ($adUser in $adUsers)
     {
         $retrievedUserInfo = [PSCustomObject]@{
@@ -166,7 +214,7 @@ $userStatus = $userStatus | Where-Object { ($_.enabled -eq $true) } | Sort-Objec
 foreach ($user in $userStatus)
 {
     #IF user is not in the ignorelist (check samAccountName, employeeID, employeeNumber)
-    if ($ignoreList -notcontains $user.samAccountName -and $ignoreList -notcontains $user.employeeID -and $ignoreList -notcontains $user.employeeNumber)
+    if ($staffInactiveIgnore -notcontains $user.samAccountName -and $staffInactiveIgnore -notcontains $user.employeeID -and $staffInactiveIgnore -notcontains $user.employeeNumber)
     {
         if ($null -eq $user.lastLogon -or $user.lastLogon -eq 0)
         {
@@ -176,9 +224,7 @@ foreach ($user in $userStatus)
             {
                 Write-Output "User $($user.samAccountName) was created more than $staffInactiveAfter days ago, Disabling account"
                 $disabledUsers += "Username: $($user.samAccountName) <br> Never Activated <br> Created On: $(Get-Date $user.whenCreated -format "yyyy-MM-dd HH:MM:ss") <br>"
-                Set-ADUser -Identity $user.samAccountName -Description "Inactive account, disabled by script $(Get-Date -Format "yyyy-MM-dd HH:MM:ss")"
-                Move-ADObject -Identity $user.DistinguishedName -TargetPath "OU=Inactive,$staffOU" -ErrorAction SilentlyContinue
-                Set-ADUser -Identity $user.samAccountName -Enabled $false
+                Disable-staffMember -userIdentity $user -userDescription "Inactive account, disabled by script $(Get-Date -Format "yyyy-MM-dd HH:MM:ss")"
             }
             else
             {
@@ -194,9 +240,7 @@ foreach ($user in $userStatus)
             {
                 Write-Output "User $($user.samAccountName) last logged on more than $staffInactiveAfter days ago, Disabling account"
                 $disabledUsers += "Username: $($user.samAccountName) <br> Last Log On: $(Get-Date $correctedLastLogin -format "yyyy-MM-dd HH:MM:ss") <br>"
-                Set-ADUser -Identity $user.samAccountName -Description "Inactive account, disabled by script $(Get-Date -Format "yyyy-MM-dd HH:MM:ss")"
-                Move-ADObject -Identity $user.DistinguishedName -TargetPath "OU=Inactive,$staffOU" -ErrorAction SilentlyContinue
-                Set-ADUser -Identity $user.samAccountName -Enabled $false
+                Disable-staffMember -userIdentity $user -userDescription "Inactive account, disabled by script $(Get-Date -Format "yyyy-MM-dd HH:MM:ss")"
             }
             else
             {
@@ -208,5 +252,5 @@ foreach ($user in $userStatus)
 
 if ($disabledUsers.Length -gt 0)
 {
-    Send-emailNotification $technicianToEmail $defaultSMTPFromAddress $smtpServerAddress $disabledUsers
+    Send-emailNotification -emailTo $technicianToEmail -emailFrom $defaultSMTPFromAddress -SMTPServer $smtpServerAddress -disabledUsers $disabledUsers
 }
